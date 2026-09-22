@@ -1,151 +1,470 @@
-name: Run Scenario
+name: Run exact AdVerify scenario
 
 on:
-  push:
-    paths:
-      - 'scenario.toml'
-  repository_dispatch:
-    types: [new-agent-version]
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: adverify-submission-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ADVERIFY_AGENT_ID: 'ADVERIFY_AGENT_ID'
+  GREEN_AGENT_ID: '019c1658-576b-7a23-8ce1-a0b4aee1c6ad'
+  GREEN_REGISTERED_IMAGE: 'ghcr.io/iker592/adverify-judge:v1.0'
+  GREEN_IMAGE: 'ghcr.io/iker592/adverify-judge@sha256:71de5628bae8088872254a72aeb358f0a4694944d41107b4ff89ed53ede002c5'
+  PARTICIPANT_IMAGE: 'ghcr.io/onejumpinc/adverify-deterministic-agent@sha256:4e4b9eb857fe1c3afa643e1001eb46f93b16283da15461bf2014050cea3013ea'
+  PARTICIPANT_IMAGE_ID: 'sha256:a2b4d60d890ce21c7c55eaf9cab6a09cf84aa26876100f2dcdc8ffb8613b31c5'
+  PARTICIPANT_MANIFEST_URL: 'https://raw.githubusercontent.com/onejumpinc/adverify-deterministic-agent/727737a20d153f1f6707e5a5867b3853c6b97311/amber-manifest.json5'
+  PARTICIPANT_MANIFEST_SHA256: 'f6ad95aa106cbcf92cc41c317e22e3d5285c4e09ef81d2c94f98033cd1e78e87'
+  CLIENT_IMAGE: 'ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e'
+  UPSTREAM_REPOSITORY: 'iker592/Agentbeats-leaderboard-adverify'
+  UPSTREAM_MAIN_SHA: '53139206525174e7f414bb6c1db2dc166ee60e07'
+  SUBMISSION_STEM: 'onejumpinc-adverify-4e4b9eb857fe'
+  COMPOSE_PROJECT_NAME: 'adverify-public'
+  COMPOSE_FILE: 'docker-compose.yml'
 
 jobs:
-  run:
-    runs-on: ubuntu-latest
-    # Run on: forks, non-main branches, or repository_dispatch/workflow_dispatch events
-    if: github.event.repository.fork == true || github.ref != 'refs/heads/main' || github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
+  evaluate:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.repository.fork == true &&
+      github.repository == 'onejumpinc/adverify-agentbeats-leaderboard' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
-      contents: write
-      packages: read
-      pull-requests: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Refuse placeholders, re-runs, and unexpected identity
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          python - <<'PY'
+          import os
+          import re
+
+          agent_id = os.environ["ADVERIFY_AGENT_ID"]
+          pattern = (
+              r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-"
+              r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+          )
+          if not re.fullmatch(pattern, agent_id):
+              raise SystemExit(
+                  f"Gate failed: ADVERIFY_AGENT_ID is not a canonical v7 UUID: {agent_id!r}"
+              )
+          PY
+
+      - name: Checkout hardened fork
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
-
-      - name: Generate docker-compose.yml
-        run: python generate_compose.py --scenario scenario.toml
-
-      - name: Pull images
+      - name: Verify scenario, registrations, and release manifest
         run: |
-          if ! docker compose pull; then
-            echo ""
-            echo "Error: Failed to pull one or more images."
-            echo "Ensure all images are publicly accessible."
-            echo "For ghcr.io images, check package settings at:"
-            echo "  https://github.com/orgs/YOUR_ORG/packages or"
-            echo "  https://github.com/users/YOUR_USER/packages"
-            exit 1
-          fi
+          cmp scenario.toml scenario.ci.toml
+          test ! -e .env
+          test ! -e .env.example
+          test ! -e compose.yaml
+          test ! -e compose.yml
+          test ! -e docker-compose.override.yml
+          test ! -e docker-compose.override.yaml
+          python - <<'PY'
+          import json
+          import os
+          import tomllib
+          import urllib.request
 
-      - name: Create output directory
-        run: mkdir -p output && chmod 777 output
 
-      - name: Export secrets as environment variables
-        env:
-          SECRETS_JSON: ${{ toJSON(secrets) }}
+          def fail(message):
+              raise SystemExit(f"Gate failed: {message}")
+
+
+          with open("scenario.toml", "rb") as source:
+              scenario = tomllib.load(source)
+          expected = {
+              "green_agent": {
+                  "agentbeats_id": os.environ["GREEN_AGENT_ID"],
+              },
+              "participants": [
+                  {
+                      "agentbeats_id": os.environ["ADVERIFY_AGENT_ID"],
+                      "name": "anomaly_detector",
+                      "env": {},
+                  }
+              ],
+              "config": {"num_campaigns": 20},
+          }
+          if scenario != expected:
+              fail(f"scenario.toml mismatch: {scenario!r}")
+          if type(scenario["config"]["num_campaigns"]) is not int:
+              fail("num_campaigns is not an integer")
+
+          def get_agent(agent_id):
+              request = urllib.request.Request(
+                  f"https://agentbeats.dev/api/agents/{agent_id}",
+                  headers={
+                      "User-Agent": (
+                          "onejumpinc-adverify-leaderboard/1.0 "
+                          "(+https://github.com/onejumpinc/adverify-agentbeats-leaderboard)"
+                      )
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+
+          green = get_agent(os.environ["GREEN_AGENT_ID"])
+          expected_green = {
+              "id": os.environ["GREEN_AGENT_ID"],
+              "creator_name": "iker592",
+              "color": "green",
+              "category_slug": "other",
+              "repo_link": "https://github.com/iker592/adverify",
+              "docker_image": os.environ["GREEN_REGISTERED_IMAGE"],
+              "amber_manifest_url": None,
+          }
+          for key, expected_value in expected_green.items():
+              actual = green.get(key)
+              if isinstance(actual, str) and key == "repo_link":
+                  actual = actual.rstrip("/")
+              if actual != expected_value:
+                  fail(f"green registration {key}={actual!r}")
+
+          participant = get_agent(os.environ["ADVERIFY_AGENT_ID"])
+          expected_participant = {
+              "id": os.environ["ADVERIFY_AGENT_ID"],
+              "creator_name": "onejumpinc",
+              "color": "purple",
+              "category_slug": "other",
+              "repo_link": (
+                  "https://github.com/onejumpinc/adverify-deterministic-agent"
+              ),
+              "amber_manifest_url": os.environ["PARTICIPANT_MANIFEST_URL"],
+          }
+          for key, expected_value in expected_participant.items():
+              actual = participant.get(key)
+              if isinstance(actual, str) and key == "repo_link":
+                  actual = actual.rstrip("/")
+              if actual != expected_value:
+                  fail(f"participant registration {key}={actual!r}")
+          if participant.get("docker_image") not in (
+              None,
+              os.environ["PARTICIPANT_IMAGE"],
+          ):
+              fail(
+                  "participant registration docker_image="
+                  f"{participant.get('docker_image')!r}"
+              )
+          if participant.get("ai_models") not in (None, []):
+              fail(f"participant unexpectedly declares models: {participant['ai_models']!r}")
+          print("Exact scenario and AgentBeats registrations verified")
+          PY
+
+          manifest_path="$RUNNER_TEMP/adverify-participant-manifest.json5"
+          curl --fail --silent --show-error --location --output "$manifest_path" "$PARTICIPANT_MANIFEST_URL"
+          printf '%s  %s\n' "$PARTICIPANT_MANIFEST_SHA256" "$manifest_path" | sha256sum --check --strict
+          grep --fixed-strings --quiet "$PARTICIPANT_IMAGE" "$manifest_path"
+
+      - name: Install pinned runner dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          tomli-w==1.2.0 pyyaml==6.0.3 requests==2.34.2
+
+      - name: Generate and verify exact runtime topology
         run: |
-          echo "$SECRETS_JSON" | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
+          python generate_compose.py --scenario scenario.toml
+          test ! -e .env
+          test ! -e .env.example
+          python - <<'PY'
+          import os
+          import tomllib
 
-      - name: Check if GHCR_TOKEN is available
-        id: check_ghcr
-        env:
-          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          import yaml
+
+
+          def fail(message):
+              raise SystemExit(f"Gate failed: {message}")
+
+
+          with open("a2a-scenario.toml", "rb") as source:
+              a2a = tomllib.load(source)
+          expected_a2a = {
+              "green_agent": {"endpoint": "http://green-agent:9009"},
+              "participants": [
+                  {
+                      "role": "anomaly_detector",
+                      "endpoint": "http://anomaly_detector:9009",
+                      "agentbeats_id": os.environ["ADVERIFY_AGENT_ID"],
+                  }
+              ],
+              "config": {"num_campaigns": 20},
+          }
+          if a2a != expected_a2a:
+              fail(f"a2a-scenario.toml mismatch: {a2a!r}")
+          expected_a2a_text = (
+              '[green_agent]\n'
+              'endpoint = "http://green-agent:9009"\n\n'
+              '[[participants]]\n'
+              'role = "anomaly_detector"\n'
+              'endpoint = "http://anomaly_detector:9009"\n'
+              f'agentbeats_id = "{os.environ["ADVERIFY_AGENT_ID"]}"\n\n'
+              '[config]\n'
+              'num_campaigns = 20\n'
+          )
+          if open("a2a-scenario.toml", encoding="utf-8").read() != expected_a2a_text:
+              fail("a2a-scenario.toml byte rendering mismatch")
+
+          healthcheck = {
+              "test": [
+                  "CMD",
+                  "curl",
+                  "-f",
+                  "http://localhost:9009/.well-known/agent-card.json",
+              ],
+              "interval": "5s",
+              "timeout": "3s",
+              "retries": 10,
+              "start_period": "30s",
+          }
+          command = ["--host", "0.0.0.0", "--port", "9009", "--card-url"]
+          expected_compose = {
+              "services": {
+                  "green-agent": {
+                      "image": os.environ["GREEN_IMAGE"],
+                      "platform": "linux/amd64",
+                      "container_name": "green-agent",
+                      "command": command + ["http://green-agent:9009"],
+                      "environment": ["PYTHONUNBUFFERED=1"],
+                      "healthcheck": healthcheck,
+                      "depends_on": {
+                          "anomaly_detector": {"condition": "service_healthy"}
+                      },
+                      "networks": ["agent-network"],
+                  },
+                  "anomaly_detector": {
+                      "image": os.environ["PARTICIPANT_IMAGE"],
+                      "platform": "linux/amd64",
+                      "container_name": "anomaly_detector",
+                      "command": command + ["http://anomaly_detector:9009"],
+                      "environment": ["PYTHONUNBUFFERED=1"],
+                      "healthcheck": healthcheck,
+                      "networks": ["agent-network"],
+                  },
+                  "agentbeats-client": {
+                      "image": "ghcr.io/agentbeats/agentbeats-client:v1.0.0",
+                      "platform": "linux/amd64",
+                      "container_name": "agentbeats-client",
+                      "volumes": [
+                          "./a2a-scenario.toml:/app/scenario.toml",
+                          "./output:/app/output",
+                      ],
+                      "command": ["scenario.toml", "output/results.json"],
+                      "depends_on": {
+                          "green-agent": {"condition": "service_healthy"},
+                          "anomaly_detector": {"condition": "service_healthy"},
+                      },
+                      "networks": ["agent-network"],
+                  },
+              },
+              "networks": {"agent-network": {"driver": "bridge"}},
+          }
+          with open("docker-compose.yml", encoding="utf-8") as source:
+              compose = yaml.safe_load(source)
+          if compose != expected_compose:
+              fail(f"generated Compose mismatch: {compose!r}")
+
+          client = compose["services"]["agentbeats-client"]
+          client["image"] = os.environ["CLIENT_IMAGE"]
+          client["command"] = ["/app/scenario.toml", "/app/output/results.json"]
+          with open("docker-compose.yml", "w", encoding="utf-8") as output:
+              yaml.safe_dump(compose, output, sort_keys=False)
+          PY
+
+          docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$COMPOSE_FILE" config --quiet
+
+      - name: Pull and verify immutable public images
         run: |
-          if [ -n "$GHCR_TOKEN" ]; then
-            echo "has_token=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_token=false" >> $GITHUB_OUTPUT
-          fi
+          install -d -m 0777 output
+          docker version > output/docker-version.txt
+          docker info > output/docker-info.txt
+          docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$COMPOSE_FILE" pull
+          docker pull "$GREEN_REGISTERED_IMAGE"
 
-      - name: Login to GitHub Container Registry
-        if: steps.check_ghcr.outputs.has_token == 'true'
-        uses: docker/login-action@v3
+          green_digests=$(docker image inspect "$GREEN_REGISTERED_IMAGE" --format '{{json .RepoDigests}}')
+          jq -e --arg expected "$GREEN_IMAGE" 'index($expected) != null' <<<"$green_digests" >/dev/null
+
+          participant_id=$(docker image inspect "$PARTICIPANT_IMAGE" --format '{{.Id}}')
+          test "$participant_id" = "$PARTICIPANT_IMAGE_ID"
+
+      - name: Run the exact 20-campaign public assessment
+        run: >-
+          docker compose
+          --project-name "$COMPOSE_PROJECT_NAME"
+          --file "$COMPOSE_FILE"
+          up --pull never --no-build --timestamps --no-color
+          --exit-code-from agentbeats-client --abort-on-container-exit
+
+      - name: Capture container logs
+        if: always()
+        run: |
+          mkdir -p output
+          docker logs green-agent > output/green.log 2>&1 || true
+          docker logs anomaly_detector > output/participant.log 2>&1 || true
+          docker logs agentbeats-client > output/client.log 2>&1 || true
+
+      - name: Record immutable provenance
+        run: >-
+          python record_provenance.py
+          --compose docker-compose.yml
+          --output output/provenance.json
+
+      - name: Verify exact live score, logs, and provenance
+        run: |
+          python verify_exact_result.py --results output/results.json --provenance output/provenance.json --green-log output/green.log --participant-log output/participant.log
+
+      - name: Preserve public-run evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Run assessment
-        run: docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
-
-      - name: Record provenance
-        run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
-
-      - name: Generate submission metadata
-        id: metadata
-        run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          USERNAME=${{ github.repository_owner }}
-          UNIQUE_NAME="${USERNAME}-${TIMESTAMP}"
-          echo "unique_name=$UNIQUE_NAME" >> $GITHUB_OUTPUT
-          echo "branch_name=submission-${UNIQUE_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Copy files to submission directory
-        run: |
-          cp scenario.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
-          cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
-          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
-
-      - name: Determine target repository
-        id: target
-        env:
-            GH_TOKEN: ${{ github.token }}
-        run: |
-            PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
-            echo "Target repository: $PARENT_REPO"
-            echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
-
-      - name: Create submission branch
-        run: |
-          git remote add upstream https://github.com/${{ steps.target.outputs.repo }}.git
-          git fetch upstream
-          git checkout -b ${{ steps.metadata.outputs.branch_name }} upstream/main
-
-      - name: Commit results
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
-          git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
-
-          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin ${{ steps.metadata.outputs.branch_name }}
-          echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${{ steps.metadata.outputs.branch_name }}"
-
-      - name: Create and merge PR (owner-triggered)
-        if: github.event_name == 'repository_dispatch' || github.event_name == 'workflow_dispatch'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Create PR
-          PR_URL=$(gh pr create \
-            --title "Submission: ${{ steps.metadata.outputs.unique_name }}" \
-            --body "Automated submission from workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --base main \
-            --head ${{ steps.metadata.outputs.branch_name }})
-          echo "Created PR: $PR_URL"
-
-          # Auto-merge
-          gh pr merge $PR_URL --squash --delete-branch
-          echo "### Results merged automatically! ✅" >> $GITHUB_STEP_SUMMARY
-          echo "PR: $PR_URL" >> $GITHUB_STEP_SUMMARY
-
-      - name: Output PR link (external submissions)
-        if: github.event_name != 'repository_dispatch' && github.event_name != 'workflow_dispatch'
-        run: |
-          echo "### Submit your results" >> $GITHUB_STEP_SUMMARY
-          echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
+          name: adverify-public-run-${{ github.run_id }}
+          path: |
+            output/
+            scenario.toml
+            scenario.ci.toml
+            a2a-scenario.toml
+            docker-compose.yml
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Cleanup
         if: always()
-        run: docker compose down -v || true
+        run: >-
+          docker compose
+          --project-name "$COMPOSE_PROJECT_NAME"
+          --file "$COMPOSE_FILE"
+          down --volumes || true
+
+  stage-submission:
+    needs: evaluate
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.repository.fork == true &&
+      github.repository == 'onejumpinc/adverify-agentbeats-leaderboard' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout hardened fork without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Download exact-gated evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: adverify-public-run-${{ github.run_id }}
+          path: ${{ runner.temp }}/adverify-evidence
+
+      - name: Re-verify downloaded score and provenance
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" = '1'
+          evidence="$RUNNER_TEMP/adverify-evidence"
+          cmp "$evidence/scenario.toml" "$evidence/scenario.ci.toml"
+          python verify_exact_result.py --results "$evidence/output/results.json" --provenance "$evidence/output/provenance.json" --green-log "$evidence/output/green.log" --participant-log "$evidence/output/participant.log"
+
+      - name: Build an exact three-file submission branch
+        run: |
+          branch="submission-$SUBMISSION_STEM"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
+            echo "Gate failed: submission branch already exists: $branch" >&2
+            exit 1
+          fi
+
+          git remote add submission-upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git fetch --no-tags submission-upstream main
+          test "$(git rev-parse FETCH_HEAD)" = "$UPSTREAM_MAIN_SHA"
+          git checkout --detach "$UPSTREAM_MAIN_SHA"
+          git switch --create "$branch"
+
+          evidence="$RUNNER_TEMP/adverify-evidence"
+          result_path="results/$SUBMISSION_STEM.json"
+          scenario_path="submissions/$SUBMISSION_STEM.toml"
+          provenance_path="submissions/$SUBMISSION_STEM.provenance.json"
+          test ! -e "$result_path"
+          test ! -e "$scenario_path"
+          test ! -e "$provenance_path"
+          cp "$evidence/output/results.json" "$result_path"
+          cp "$evidence/scenario.toml" "$scenario_path"
+          cp "$evidence/output/provenance.json" "$provenance_path"
+          git add "$result_path" "$scenario_path" "$provenance_path"
+
+          python - <<'PY'
+          import os
+          import subprocess
+
+          stem = os.environ["SUBMISSION_STEM"]
+          actual = subprocess.check_output(
+              ["git", "diff", "--cached", "--name-status"],
+              text=True,
+          ).splitlines()
+          expected = [
+              f"A\tresults/{stem}.json",
+              f"A\tsubmissions/{stem}.provenance.json",
+              f"A\tsubmissions/{stem}.toml",
+          ]
+          if actual != expected:
+              raise SystemExit(
+                  f"Gate failed: staged submission delta={actual!r}, expected={expected!r}"
+              )
+          PY
+
+          {
+            echo "branch=$branch"
+            echo "result_path=$result_path"
+            echo "scenario_path=$scenario_path"
+            echo "provenance_path=$provenance_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Commit and push exact-gated results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: '!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m "Submission: $SUBMISSION_STEM
+
+          Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          git push origin "$branch"
+          echo "::notice title=Submission Branch Created::$branch"
+
+      - name: Output pull request link
+        run: |
+          {
+            echo '### Submit exact-gated AdVerify results'
+            echo "[Open a pull request](https://github.com/$UPSTREAM_REPOSITORY/compare/main...onejumpinc:adverify-agentbeats-leaderboard:$branch?expand=1)"
+            echo ''
+            echo 'No pull request was opened or merged automatically.'
+          } >> "$GITHUB_STEP_SUMMARY"
